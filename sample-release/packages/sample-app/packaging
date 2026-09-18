@@ -1,0 +1,7 @@
+#!/bin/bash
+set -ex
+ls -la
+ls -la sample-app/ || true
+cp sample-app/app ${BOSH_INSTALL_TARGET}/app
+chmod +x ${BOSH_INSTALL_TARGET}/app
+ls -la ${BOSH_INSTALL_TARGET}/

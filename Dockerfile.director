@@ -1,0 +1,119 @@
+# ARM64 BOSH Director - Built from source
+# Compiles the actual BOSH Director Ruby application for ARM64
+#
+# Base image is pulled from the Amazon ECR Public Gallery (canonical Ubuntu
+# publisher) rather than Docker Hub. ECR Public is publicly pullable, so this
+# also works for external consumers of this sample.
+# See: https://gallery.ecr.aws/ubuntu/ubuntu
+# Pinned by digest (immutable) in addition to the readable 24.04 tag.
+FROM --platform=linux/arm64 public.ecr.aws/ubuntu/ubuntu:24.04@sha256:bd96226c844259db876a6041a99d9a5aad65b3bfdb8df039441b17bbc4f756b8
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=en_US.UTF-8
+
+# Use bash with pipefail so failures in any stage of a piped RUN are caught,
+# not just the last one. The `echo <sha> | sha256sum -c -` checks below are
+# already safe (sha256sum is the final stage, so a mismatch fails the RUN), but
+# without pipefail any future pipe whose failure is upstream would pass
+# silently. Matches Dockerfile.stemcell.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    curl \
+    wget \
+    jq \
+    libpq-dev \
+    libmysqlclient-dev \
+    libxml2-dev \
+    libxslt-dev \
+    libsqlite3-dev \
+    libssl-dev \
+    libreadline-dev \
+    libyaml-dev \
+    zlib1g-dev \
+    sqlite3 \
+    postgresql \
+    postgresql-client \
+    nginx \
+    apache2-utils \
+    openssh-server \
+    ca-certificates \
+    locales \
+    && locale-gen en_US.UTF-8 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Ruby 3.4 from source (BOSH Director requires >= 3.4.0)
+RUN wget -q https://cache.ruby-lang.org/pub/ruby/3.4/ruby-3.4.10.tar.gz && \
+    echo "ecee2d072a14f2d14347dd56dfd8fe5c3130abf5117bfaacbda0f4ef9cc429ec  ruby-3.4.10.tar.gz" | sha256sum -c - && \
+    tar xzf ruby-3.4.10.tar.gz && \
+    cd ruby-3.4.10 && \
+    ./configure --disable-install-doc && \
+    make -j"$(nproc)" && \
+    make install && \
+    cd / && rm -rf ruby-3.4.10 ruby-3.4.10.tar.gz && \
+    gem install bundler
+
+# Install Go 1.26 for ARM64 (Docker CPI's go.mod requires go >= 1.26.0)
+RUN wget -q https://go.dev/dl/go1.26.8.linux-arm64.tar.gz && \
+    echo "211ffced9dcb9633a55eac6364816ec0ddd951389a740e88fa8b3337971bdda0  go1.26.8.linux-arm64.tar.gz" | sha256sum -c - && \
+    tar -C /usr/local -xzf go1.26.8.linux-arm64.tar.gz && \
+    rm go1.26.8.linux-arm64.tar.gz
+ENV PATH=$PATH:/usr/local/go/bin
+ENV GOTOOLCHAIN=local
+
+# Create BOSH directory structure
+RUN mkdir -p /var/vcap/bosh/bin \
+    /var/vcap/bosh/etc \
+    /var/vcap/store/director \
+    /var/vcap/data/postgres \
+    /var/vcap/sys/log
+
+# Clone and build BOSH Director
+# Pinned to an exact commit (default branch is a moving target; a new release
+# can change the Director source or its Go/Ruby requirements and break the POC).
+RUN git clone --filter=blob:none https://github.com/cloudfoundry/bosh.git /opt/bosh && \
+    git -C /opt/bosh checkout cce516dc4476c8a4aef70717529bbbd71b228387
+WORKDIR /opt/bosh/src/bosh-director
+RUN rm -rf /opt/bosh/src/vendor/cache && bundle install --jobs "$(nproc)"
+# PATCH: Disable TLS for NATS in development
+RUN sed -i 's/tls: {/# tls_disabled: {/' lib/bosh/director/nats_rpc.rb && \
+    sed -i 's/context: tls_context,/# context: tls_context,/' lib/bosh/director/nats_rpc.rb && \
+    sed -i '/# context: tls_context,/{n;s/},/# },/}' lib/bosh/director/nats_rpc.rb
+
+# Clone and build BOSH Docker CPI (with ARM64 platform patch)
+# Pinned to an exact commit (see note above).
+RUN git clone --filter=blob:none https://github.com/cloudfoundry/bosh-docker-cpi-release.git /opt/bosh-docker-cpi && \
+    git -C /opt/bosh-docker-cpi checkout a5f8a9b13c66fb55a6d8b01d626f687e7934b51a
+WORKDIR /opt/bosh-docker-cpi/src/bosh-docker-cpi
+RUN sed -i 's/platform.Architecture = "amd64"/platform.Architecture = runtime.GOARCH/' vm/container.go && \
+    sed -i 's/vmProps.Platform.Architecture = "amd64"/vmProps.Platform.Architecture = runtime.GOARCH/' vm/factory.go && \
+    sed -i '/^import (/a\\t"runtime"' vm/container.go && \
+    sed -i '/^import (/a\\t"runtime"' vm/factory.go && \
+    sed -i 's|Platform: "linux/amd64"|Platform: "linux/" + runtime.GOARCH|' stemcell/fs_importer.go && \
+    sed -i '/^import (/a\\t"runtime"' stemcell/fs_importer.go && \
+    go build -o /var/vcap/bosh/bin/docker_cpi ./main
+
+# Copy our compiled BOSH agent (built into bin/ by scripts/build-binaries.sh)
+COPY bin/bosh-agent-arm64 /var/vcap/bosh/bin/bosh-agent
+# Copy davcli binary for Director's blobstore access
+RUN mkdir -p /var/vcap/packages/davcli/bin
+COPY bin/bosh-blobstore-dav /var/vcap/packages/davcli/bin/davcli
+RUN chmod +x /var/vcap/bosh/bin/bosh-agent /var/vcap/bosh/bin/docker_cpi /var/vcap/packages/davcli/bin/davcli
+
+# Copy pre-built NATS server for ARM64 (fetched into bin/ by scripts/build-binaries.sh)
+COPY bin/nats-server-arm64 /var/vcap/bosh/bin/nats
+RUN chmod +x /var/vcap/bosh/bin/nats
+
+# Setup PostgreSQL for BOSH Director
+RUN mkdir -p /var/run/postgresql && chown postgres:postgres /var/run/postgresql
+
+# Create startup script
+COPY scripts/start-director.sh /opt/start-director.sh
+RUN chmod +x /opt/start-director.sh
+
+EXPOSE 25555 4222 6868 25250
+
+CMD ["/opt/start-director.sh"]

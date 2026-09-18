@@ -1,0 +1,91 @@
+# Pre-commit hooks for ARM64 BOSH-lite.
+#
+# Setup:
+#   pre-commit install
+#
+# Run against the whole repo once before relying on it:
+#   pre-commit run --all-files
+#
+# ctl.sh is an ERB template rendered by BOSH (`<%= p('port') %>`), not valid
+# shell, so it is excluded from the shell linters/formatters globally.
+exclude: '^sample-release/jobs/[^/]+/templates/'
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      # This repo commits no binaries (the ARM64 prerequisites are built into
+      # the git-ignored bin/ by scripts/build-binaries.sh). Guard against
+      # multi-megabyte blobs being added.
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+        # BOSH release `packaging` scripts carry a shebang but are invoked by the
+        # BOSH agent rather than executed directly, so they are intentionally
+        # not marked executable. Excluded to avoid a false positive.
+        exclude: '^sample-release/packages/[^/]+/(packaging|pre_packaging)$'
+      # scripts/patches/*.patch is excluded from all three whitespace fixers.
+      # A unified diff encodes content in leading/trailing whitespace (a blank
+      # context line is a single space), so rewriting it corrupts the patch.
+      - id: end-of-file-fixer
+        exclude: '^scripts/patches/'
+      - id: trailing-whitespace
+        exclude: '^scripts/patches/'
+      - id: mixed-line-ending
+        args: [--fix=lf]
+        exclude: '^scripts/patches/'
+
+  # Scan full history (not just staged changes) with:
+  # $ gitleaks git --log-opts="--all"
+  - repo: local
+    hooks:
+      - id: gitleaks
+        name: gitleaks (staged)
+        entry: gitleaks git --staged --redact --no-banner
+        language: system
+        pass_filenames: false
+
+  # Shell and Dockerfile linting via locally installed binaries:
+  # $ brew install shellcheck shfmt hadolint
+  - repo: local
+    hooks:
+      # Covers *.sh plus extensionless scripts with a shebang (e.g.
+      # sample-release/packages/sample-app/packaging), via shebang detection.
+      - id: shellcheck
+        name: shellcheck
+        entry: shellcheck -x --severity=warning
+        language: system
+        types: [shell]
+
+      # -d = diff only (fails, does not rewrite); -i 4 matches existing style.
+      - id: shfmt
+        name: shfmt
+        entry: shfmt -d -i 4 -ci
+        language: system
+        types: [shell]
+
+      - id: hadolint
+        name: hadolint
+        entry: hadolint
+        language: system
+        files: '^Dockerfile\.'
+
+  # Go lives in a nested module (sample-release/src/sample-app), so these are
+  # local hooks scoped to that directory rather than repo-root Go hooks.
+  - repo: local
+    hooks:
+      - id: gofmt
+        name: gofmt
+        entry: gofmt -l -w
+        language: system
+        types: [go]
+
+      - id: go-vet
+        name: go vet (sample-app)
+        entry: bash -c 'cd sample-release/src/sample-app && go vet ./...'
+        language: system
+        files: '^sample-release/src/sample-app/'
+        pass_filenames: false

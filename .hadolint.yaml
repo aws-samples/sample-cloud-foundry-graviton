@@ -1,0 +1,31 @@
+# hadolint configuration for the ARM64 BOSH-lite sample.
+#
+# The rules below are intentionally ignored for this developer-facing,
+# local-only proof-of-concept. Each is a deliberate choice, not an oversight:
+#
+#   DL3029 - "Do not use --platform in FROM": the --platform=linux/arm64 pin is
+#            the entire point of this sample (forcing ARM64 builds on any host).
+#   DL3008 - "Pin apt versions": pinning every Ubuntu apt package to an exact
+#            version makes the sample fail to build as the Ubuntu repos roll
+#            forward. Left unpinned deliberately for a POC that users rebuild.
+#   DL3028 - "Pin gem versions": same rationale as DL3008 for `gem install
+#            bundler`; the latest compatible bundler is resolved at build time.
+#   DL3003 - "Use WORKDIR instead of cd": the `cd` sits inside a multi-command
+#            RUN that builds and then deletes the source dir; WORKDIR would
+#            leave a dangling working directory.
+#   SC2016 - "Expressions don't expand in single quotes": intentional. The
+#            single-quoted `$1`/`$2`/`$@` are written verbatim into generated
+#            helper scripts (sv wrapper, resolvconf stub) and must expand at
+#            script run time, not at image build time.
+#   DL3059 - "Multiple consecutive RUN instructions": the clone/patch/build
+#            steps are deliberately kept as separate RUN layers for readability
+#            and cache reuse; consolidating them would require a `cd` into a
+#            not-yet-created directory (which then trips DL3003) and tangle the
+#            distinct clone -> patch -> build stages.
+ignored:
+  - DL3029
+  - DL3008
+  - DL3028
+  - DL3003
+  - DL3059
+  - SC2016

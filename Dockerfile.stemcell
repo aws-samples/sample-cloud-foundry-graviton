@@ -1,0 +1,172 @@
+# ARM64 Warden Stemcell Base Image
+# This creates a Docker image that BOSH Docker CPI uses as a "stemcell"
+#
+# Base image is pulled from the Amazon ECR Public Gallery (canonical Ubuntu
+# publisher) rather than Docker Hub. ECR Public is publicly pullable, so this
+# also works for external consumers of this sample.
+# See: https://gallery.ecr.aws/ubuntu/ubuntu
+# Pinned by digest (immutable) in addition to the readable 24.04 tag.
+FROM --platform=linux/arm64 public.ecr.aws/ubuntu/ubuntu:24.04@sha256:bd96226c844259db876a6041a99d9a5aad65b3bfdb8df039441b17bbc4f756b8
+
+# Use bash with pipefail so failures in any stage of a piped RUN are caught.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Install base packages matching a BOSH stemcell
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    systemd \
+    systemd-sysv \
+    sudo \
+    openssh-server \
+    curl \
+    wget \
+    ca-certificates \
+    openssl \
+    locales \
+    dbus \
+    iproute2 \
+    iputils-ping \
+    net-tools \
+    rsyslog \
+    logrotate \
+    cron \
+    vim-tiny \
+    lsb-release \
+    gnupg \
+    jq \
+    tar \
+    gzip \
+    bzip2 \
+    unzip \
+    procps \
+    runit \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build monit 5.25.3 from source with CSRF disabled
+# BOSH agent uses monit's HTTP API without CSRF tokens.
+# Production BOSH stemcells use a custom monit build without CSRF enforcement.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    autoconf automake libtool libssl-dev zlib1g-dev flex bison make gcc libc6-dev && \
+    cd /tmp && \
+    curl -sL https://mmonit.com/monit/dist/monit-5.25.3.tar.gz -o monit-5.25.3.tar.gz && \
+    echo "c10258c8839d20864d30390e7cbf2ff5e0480a67a6fb80c02aa457d6e3390569  monit-5.25.3.tar.gz" | sha256sum -c - && \
+    tar xzf monit-5.25.3.tar.gz && \
+    cd monit-5.25.3 && \
+    ./configure --without-pam --prefix=/usr && \
+    sed -i 's/if (IS(req->method, METHOD_POST)) {/if (IS(req->method, METHOD_POST)) { return true; \/* CSRF disabled *\//' src/http/processor.c && \
+    make -j"$(nproc)" && \
+    cp monit /usr/bin/monit && \
+    cd / && rm -rf /tmp/monit-5.25.3 /tmp/monit-5.25.3.tar.gz && \
+    apt-get purge -y autoconf automake libtool flex bison make gcc && apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
+
+# Generate locale
+RUN locale-gen en_US.UTF-8
+
+# Create vcap user (BOSH standard)
+# No fixed password is baked into the image. The BOSH agent authenticates via
+# SSH key injection, and sudo is passwordless (NOPASSWD) for the vcap group, so
+# an interactive password is not required. We set a random, discarded password
+# at build time purely so the account is not left password-less; password-based
+# SSH login for vcap is neither expected nor relied upon.
+RUN useradd -m -s /bin/bash -G sudo vcap && \
+    echo "vcap:$(openssl rand -base64 32)" | chpasswd && \
+    echo "vcap ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/vcap && \
+    chmod 440 /etc/sudoers.d/vcap
+
+# Create BOSH directory structure
+RUN mkdir -p /var/vcap/bosh/bin \
+    /var/vcap/bosh/etc \
+    /var/vcap/bosh/log \
+    /var/vcap/data \
+    /var/vcap/store \
+    /var/vcap/jobs \
+    /var/vcap/packages \
+    /var/vcap/monit
+
+# Copy BOSH agent (will be added at build time)
+COPY bin/bosh-agent-arm64 /var/vcap/bosh/bin/bosh-agent
+RUN chmod +x /var/vcap/bosh/bin/bosh-agent
+
+# Configure SSH. Password authentication is disabled to match the comment on the
+# vcap user above: the BOSH agent authenticates via SSH key injection, so no
+# password login path is needed. (sshd is not started by any runit/systemd
+# service in this stemcell; this hardens the config in case one is added.)
+RUN mkdir -p /var/run/sshd && \
+    sed -i 's/#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config && \
+    sed -i 's/#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+
+# BOSH agent config (for Docker CPI / warden environment)
+RUN echo '{"Platform":{"Linux":{"SkipDiskSetup":true,"DevicePathResolutionType":"virtio","CreatePartitionIfNoEphemeralDisk":false}},"Infrastructure":{"Settings":{"Sources":[{"Type":"File","MetaDataPath":"","UserDataPath":"/var/vcap/bosh/warden-cpi-agent-env.json","SettingsPath":"/var/vcap/bosh/warden-cpi-agent-env.json"}]}}}' > /var/vcap/bosh/etc/agent.json
+
+# Create sync-time script (required by Docker CPI)
+RUN echo '#!/bin/bash' > /var/vcap/bosh/bin/sync-time && \
+    echo 'chronyc -a makestep' >> /var/vcap/bosh/bin/sync-time && \
+    chmod +x /var/vcap/bosh/bin/sync-time
+
+# Create bosh-agent-rc script (runtime configuration - required by agent bootstrap)
+RUN printf '#!/bin/bash\n# Runtime config setup for Docker-based stemcell\numount /etc/resolv.conf 2>/dev/null || true\numount /etc/hosts 2>/dev/null || true\numount /etc/hostname 2>/dev/null || true\nmkdir -p /run/resolvconf\necho "nameserver 8.8.8.8" > /run/resolvconf/resolv.conf\nln -sf /run/resolvconf/resolv.conf /etc/resolv.conf 2>/dev/null || true\nexit 0\n' > /usr/local/bin/bosh-agent-rc && \
+    chmod +x /usr/local/bin/bosh-agent-rc
+
+# Create stub scripts required by BOSH agent bootstrap
+RUN printf '#!/bin/bash\nexit 0\n' > /var/vcap/bosh/bin/bosh-start-logging-and-auditing && \
+    chmod +x /var/vcap/bosh/bin/bosh-start-logging-and-auditing
+
+# Create monit runit service directory (BOSH agent starts monit via runit)
+RUN mkdir -p /etc/sv/monit/log && \
+    printf '#!/bin/sh\nexec /usr/bin/monit -I -c /var/vcap/bosh/etc/monitrc\n' > /etc/sv/monit/run && \
+    chmod +x /etc/sv/monit/run && \
+    printf '#!/bin/sh\nexec svlogd -tt /var/vcap/monit/svlog\n' > /etc/sv/monit/log/run && \
+    chmod +x /etc/sv/monit/log/run && \
+    ln -s /etc/sv/monit /etc/service/monit && \
+    mkdir -p /var/vcap/monit/svlog && \
+    mkdir -p /var/vcap/bosh/etc && \
+    printf 'set httpd port 2822\n  use address 127.0.0.1\n  allow 127.0.0.1\n  allow admin:monit\n  allow vcap:random-password\nset daemon 10\nset logfile /var/vcap/monit/monit.log\ninclude /var/vcap/monit/job/*.monitrc\n\n# Placeholder so "monit stop -g vcap" does not fail before any jobs are deployed\ncheck program vcap-placeholder path /bin/true\n  if status != 0 then alert\n  group vcap\n' > /var/vcap/bosh/etc/monitrc && \
+    chmod 700 /var/vcap/bosh/etc/monitrc && \
+    mkdir -p /var/vcap/monit/job && \
+    ln -sf /var/vcap/bosh/etc/monitrc /etc/monitrc
+
+# sv wrapper: in systemd mode, "sv start monit" should wait for monit to be ready
+RUN mv /usr/bin/sv /usr/bin/sv.real 2>/dev/null || true && \
+    printf '#!/bin/bash\nif [ "$1" = "start" ] && [ "$2" = "monit" ]; then\n  # Wait for monit to be ready. Monit binds with auth, so it answers 401 when\n  # up (not 200); treat either as "ready" (matches bosh-agent.service check).\n  for i in $(seq 1 30); do\n    code=$(curl -s -o /dev/null -w "%%{http_code}" http://127.0.0.1:2822/ 2>/dev/null)\n    if [ "$code" = "200" ] || [ "$code" = "401" ]; then\n      echo "ok: run: monit"\n      exit 0\n    fi\n    sleep 1\n  done\n  echo "ok: run: monit (not yet ready)"\n  exit 0\nfi\nexec /usr/bin/sv.real "$@" 2>/dev/null || echo "ok: run: $2"\n' > /usr/bin/sv && \
+    chmod +x /usr/bin/sv
+
+# Monit systemd service — starts monit automatically on boot (BEFORE agent)
+RUN printf '[Unit]\nDescription=Monit Process Manager\nAfter=network.target\nBefore=bosh-agent.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/monit -I -c /var/vcap/bosh/etc/monitrc\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/monit.service && \
+    systemctl enable monit.service
+
+# Create directories required by BOSH agent networking bootstrap
+RUN mkdir -p /etc/resolvconf/resolv.conf.d && \
+    touch /etc/resolvconf/resolv.conf.d/base && \
+    mkdir -p /run/resolvconf && \
+    echo "nameserver 8.8.8.8" > /run/resolvconf/resolv.conf && \
+    printf '#!/bin/bash\n# resolvconf stub for Ubuntu 24.04 (not available as package)\n# BOSH agent calls "resolvconf -u" to update DNS\nif [ "$1" = "-u" ]; then\n  cat /run/resolvconf/resolv.conf > /etc/resolv.conf 2>/dev/null || true\nfi\nexit 0\n' > /usr/sbin/resolvconf && \
+    chmod +x /usr/sbin/resolvconf
+
+# systemd setup for container
+RUN systemctl set-default multi-user.target && \
+    systemctl mask dev-hugepages.mount sys-fs-fuse-connections.mount
+
+# BOSH agent as a runit service (for non-systemd mode)
+RUN mkdir -p /etc/sv/agent/log && \
+    printf '#!/bin/bash\nexport BOSH_AGENT_DEV_INSECURE_NATS=1\nexec /var/vcap/bosh/bin/bosh-agent -P ubuntu -C /var/vcap/bosh/etc/agent.json 2>&1\n' > /etc/sv/agent/run && \
+    chmod +x /etc/sv/agent/run && \
+    printf '#!/bin/sh\nmkdir -p /var/vcap/bosh/log\nexec svlogd -tt /var/vcap/bosh/log\n' > /etc/sv/agent/log/run && \
+    chmod +x /etc/sv/agent/log/run && \
+    ln -s /etc/sv/agent /etc/service/agent
+
+# BOSH agent systemd service (for systemd mode — Docker CPI start_containers_with_systemd)
+RUN printf '[Unit]\nDescription=BOSH Agent\nAfter=network-online.target monit.service\nWants=network-online.target monit.service\n\n[Service]\nType=simple\nEnvironment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/var/vcap/bosh/bin\nEnvironment=BOSH_AGENT_DEV_INSECURE_NATS=1\nExecStartPre=/bin/bash -c "mkdir -p /run/resolvconf && echo nameserver 8.8.8.8 > /run/resolvconf/resolv.conf && rm -f /etc/resolv.conf && ln -sf /run/resolvconf/resolv.conf /etc/resolv.conf && for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do curl -so /dev/null -w %%{http_code} http://127.0.0.1:2822/ 2>/dev/null | grep -qE 200\\|401 && break || sleep 2; done"\nExecStart=/var/vcap/bosh/bin/bosh-agent -P ubuntu -C /var/vcap/bosh/etc/agent.json\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/bosh-agent.service && \
+    systemctl enable bosh-agent.service
+
+# Ensure bash and essential utils are in path
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/var/vcap/bosh/bin
+
+# Copy real bosh-blobstore-dav binary (compiled from github.com/cloudfoundry/bosh-davcli)
+COPY bin/bosh-blobstore-dav /var/vcap/bosh/bin/bosh-blobstore-dav
+RUN chmod +x /var/vcap/bosh/bin/bosh-blobstore-dav
+
+# Use runit as init (same as production warden stemcells)
+# runsvdir-start is a wrapper that real stemcells have
+RUN printf '#!/bin/bash\nexec runsvdir -P /etc/service\n' > /usr/sbin/runsvdir-start && \
+    chmod +x /usr/sbin/runsvdir-start
+CMD ["/usr/sbin/runsvdir-start"]

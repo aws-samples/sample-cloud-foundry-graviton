@@ -1,0 +1,10 @@
+---
+name: sample-app
+templates:
+  ctl.sh: bin/ctl
+packages:
+- sample-app
+properties:
+  port:
+    description: "Port for the sample app to listen on"
+    default: 8080

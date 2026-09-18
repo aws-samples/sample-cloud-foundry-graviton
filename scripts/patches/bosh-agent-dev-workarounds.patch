@@ -1,0 +1,279 @@
+diff --git a/jobsupervisor/monit/status.go b/jobsupervisor/monit/status.go
+index 49c1378..d5e71fc 100644
+--- a/jobsupervisor/monit/status.go
++++ b/jobsupervisor/monit/status.go
+@@ -11,8 +11,21 @@ type status struct {
+ 	Incarnation string   `xml:"incarnation,attr"`
+ 	Version     string   `xml:"version,attr"`
+ 
++	// Monit 5.33+ uses nested server element for incarnation
++	Server serverTag `xml:"server"`
++
++	// Old format: <services><service name="...">
+ 	Services      servicesTag
+ 	ServiceGroups serviceGroupsTag
++
++	// Monit 5.33+ format: <service type="X"><name>...</name> directly under <monit>
++	DirectServices []serviceTag `xml:"service"`
++}
++
++type serverTag struct {
++	ID          string `xml:"id"`
++	Incarnation string `xml:"incarnation"`
++	Version     string `xml:"version"`
+ }
+ 
+ type servicesTag struct {
+@@ -21,16 +34,24 @@ type servicesTag struct {
+ }
+ 
+ type serviceTag struct {
+-	XMLName       xml.Name  `xml:"service"`
+-	Name          string    `xml:"name,attr"`
+-	Pending       int       `xml:"pendingaction"`
+-	Status        int       `xml:"status"`
+-	StatusMessage string    `xml:"status_message"`
+-	Monitor       int       `xml:"monitor"`
+-	Uptime        int       `xml:"uptime"`
+-	Children      int       `xml:"children"`
++	XMLName       xml.Name `xml:"service"`
++	Name          string   `xml:"name,attr"`
++	NameElement   string   `xml:"name"` // Monit 5.33+ uses child element
++	Pending       int      `xml:"pendingaction"`
++	Status        int      `xml:"status"`
++	StatusMessage string   `xml:"status_message"`
++	Monitor       int      `xml:"monitor"`
++	Uptime        int      `xml:"uptime"`
++	Children      int      `xml:"children"`
+ 	Memory        memoryTag `xml:"memory"`
+-	CPU           cpuTag    `xml:"cpu"`
++	CPU           cpuTag   `xml:"cpu"`
++}
++
++func (s serviceTag) GetName() string {
++	if s.Name != "" {
++		return s.Name
++	}
++	return s.NameElement
+ }
+ 
+ type memoryTag struct {
+@@ -96,14 +117,39 @@ func (status status) ServicesInGroup(name string) (services []Service) {
+ 	services = []Service{}
+ 
+ 	serviceGroupTag, found := status.ServiceGroups.Get(name)
++
++	// Merge old-format services and new-format direct services
++	allServices := status.Services.Services
++	allServices = append(allServices, status.DirectServices...)
++
+ 	if !found {
++		// Monit 5.33+ doesn't have servicegroups in XML — treat all services as in "vcap" group
++		if name == "vcap" && len(status.DirectServices) > 0 {
++			for _, serviceTag := range allServices {
++				svcName := serviceTag.GetName()
++				service := Service{
++					Name:                 svcName,
++					Pending:              serviceTag.Pending > 0,
++					Status:               serviceTag.StatusString(),
++					Errored:              serviceTag.Status > 0 && serviceTag.StatusMessage != "",
++					StatusMessage:        serviceTag.StatusMessage,
++					Monitored:            serviceTag.Monitor > 0,
++					Uptime:               serviceTag.Uptime,
++					MemoryPercentTotal:   serviceTag.Memory.PercentTotal,
++					MemoryKilobytesTotal: serviceTag.Memory.KilobyteTotal,
++					CPUPercentTotal:      serviceTag.CPU.PercentTotal,
++				}
++				services = append(services, service)
++			}
++		}
+ 		return
+ 	}
+ 
+-	for _, serviceTag := range status.Services.Services {
+-		if serviceGroupTag.Contains(serviceTag.Name) {
++	for _, serviceTag := range allServices {
++		svcName := serviceTag.GetName()
++		if serviceGroupTag.Contains(svcName) {
+ 			service := Service{
+-				Name:                 serviceTag.Name,
++				Name:                 svcName,
+ 				Pending:              serviceTag.Pending > 0,
+ 				Status:               serviceTag.StatusString(),
+ 				Errored:              serviceTag.Status > 0 && serviceTag.StatusMessage != "",
+@@ -122,5 +168,10 @@ func (status status) ServicesInGroup(name string) (services []Service) {
+ }
+ 
+ func (status status) GetIncarnation() (int, error) {
+-	return strconv.Atoi(status.Incarnation)
++	// Support both old format (attribute) and new monit 5.33+ format (nested element)
++	inc := status.Incarnation
++	if inc == "" {
++		inc = status.Server.Incarnation
++	}
++	return strconv.Atoi(inc)
+ }
+diff --git a/jobsupervisor/monit_job_supervisor.go b/jobsupervisor/monit_job_supervisor.go
+index a81e095..e51660e 100644
+--- a/jobsupervisor/monit_job_supervisor.go
++++ b/jobsupervisor/monit_job_supervisor.go
+@@ -71,54 +71,39 @@ func NewMonitJobSupervisor(
+ }
+ 
+ func (m monitJobSupervisor) Reload() error {
+-	var currentIncarnation int
+-
++	// In containerized environments with systemd, the standard kill+start cycle
++	// for monit doesn't work reliably. Use 'monit reload' CLI which signals
++	// monit to re-read its config without restarting the process.
+ 	oldIncarnation, err := m.getIncarnation()
+ 	if err != nil {
+-		return bosherr.WrapError(err, "Getting monit incarnation")
++		// Not fatal: if we cannot read the incarnation we fall back to a bounded
++		// wait below rather than failing the reload outright.
++		m.logger.Debug(monitJobSupervisorLogTag, "Could not read monit incarnation before reload: %s", err.Error())
++		oldIncarnation = -1
+ 	}
+ 
+-	// Monit process could be started in the same second as `monit reload` runs
+-	// so it's ideal for MaxCheckTries * DelayBetweenCheckTries to be greater than 1 sec
+-	// because monit incarnation id is just a timestamp with 1 sec resolution.
+-	for reloadI := 0; reloadI < m.reloadOptions.MaxTries; reloadI++ {
+-		// Due to limitations in the version of monit that we are currently using,
+-		// it is faster to reload the agent through by killing the process. This is due to
+-		// the fact that a reload only occurs after a heartbeat which occurs every
+-		// 10 seconds.
+-		err := m.serviceManager.Kill("monit")
+-		if err != nil {
+-			m.logger.Error(monitJobSupervisorLogTag, "Failed to kill monit while reloading: %s", err.Error())
+-			continue
+-		}
+-
+-		// Idempotently start monit to ensure that monit is being started after
+-		// `sv kill`.
+-		err = m.serviceManager.Start("monit")
+-		if err != nil {
+-			m.logger.Error(monitJobSupervisorLogTag, "Failed to start monit while reloading: %s", err.Error())
+-			continue
+-		}
++	_, _, _, err = m.runner.RunCommand("monit", "reload")
++	if err != nil {
++		m.logger.Error(monitJobSupervisorLogTag, "monit reload failed: %s", err.Error())
++		return bosherr.WrapError(err, "Reloading monit")
++	}
+ 
+-		for checkI := 0; checkI < m.reloadOptions.MaxCheckTries; checkI++ {
+-			if m.incarnationChanged(oldIncarnation) {
++	// Poll (bounded) for monit to finish processing the reload rather than
++	// sleeping a fixed interval, so slow environments still succeed and fast
++	// ones do not wait longer than necessary. Bounds come from reloadOptions.
++	for i := 0; i < m.reloadOptions.MaxCheckTries; i++ {
++		if oldIncarnation < 0 {
++			// Couldn't baseline the incarnation; just confirm monit is responsive.
++			if _, incErr := m.getIncarnation(); incErr == nil {
+ 				return nil
+ 			}
+-
+-			m.logger.Debug(
+-				monitJobSupervisorLogTag,
+-				"Waiting for monit to reload: before=%d after=%d",
+-				oldIncarnation, currentIncarnation,
+-			)
+-
+-			time.Sleep(m.reloadOptions.DelayBetweenCheckTries)
++		} else if m.incarnationChanged(oldIncarnation) {
++			return nil
+ 		}
++		time.Sleep(m.reloadOptions.DelayBetweenCheckTries)
+ 	}
+ 
+-	return bosherr.Errorf(
+-		"Failed to reload monit: before=%d after=%d",
+-		oldIncarnation, currentIncarnation,
+-	)
++	return bosherr.Errorf("Timed out waiting for monit to reload after %d checks", m.reloadOptions.MaxCheckTries)
+ }
+ 
+ func (m monitJobSupervisor) incarnationChanged(incarnation int) bool {
+diff --git a/jobsupervisor/provider.go b/jobsupervisor/provider.go
+index 6f4f364..e2285e1 100644
+--- a/jobsupervisor/provider.go
++++ b/jobsupervisor/provider.go
+@@ -41,8 +41,8 @@ func NewProvider(
+ 		jobSupervisorListenPort,
+ 		MonitReloadOptions{
+ 			MaxTries:               3,
+-			MaxCheckTries:          10,
+-			DelayBetweenCheckTries: 1 * time.Second,
++			MaxCheckTries:          30,
++			DelayBetweenCheckTries: 2 * time.Second,
+ 		},
+ 		timeService,
+ 		platform.GetServiceManager(),
+diff --git a/mbus/nats_handler.go b/mbus/nats_handler.go
+index dd080df..81f1009 100644
+--- a/mbus/nats_handler.go
++++ b/mbus/nats_handler.go
+@@ -190,7 +190,13 @@ func (h *natsHandler) Start(handlerFunc boshhandler.Func) error {
+ 			return reconnectDelay
+ 		}),
+ 		nats.MaxReconnects(-1),
+-		nats.Secure(connectionInfo.TLSConfig),
++	}
++
++	// DEV WORKAROUND: when BOSH_AGENT_DEV_INSECURE_NATS is set, connect to NATS
++	// without TLS to match the plaintext NATS used by the local Docker-CPI dev
++	// setup. In any other case (production/default) keep upstream mutual-TLS.
++	if !devInsecureNATS() {
++		natsOptions = append(natsOptions, nats.Secure(connectionInfo.TLSConfig))
+ 	}
+ 
+ 	connection, err := h.connector(connectionInfo.Addr, natsOptions...)
+@@ -324,6 +330,13 @@ func (h *natsHandler) getConnectionInfo() (*ConnectionInfo, error) {
+ 
+ 	connInfo.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+ 
++	// DEV WORKAROUND: only skip peer verification / client-cert when the local
++	// dev flag is set (plaintext NATS). Production keeps full mutual TLS.
++	if devInsecureNATS() {
++		connInfo.TLSConfig.InsecureSkipVerify = true // #nosec G402 -- dev-only, gated by BOSH_AGENT_DEV_INSECURE_NATS
++		return connInfo, nil
++	}
++
+ 	caCert := settings.GetMbusCerts().CA
+ 	if caCert != "" {
+ 		connInfo.TLSConfig.RootCAs = x509.NewCertPool()
+@@ -343,6 +356,19 @@ func (h *natsHandler) getConnectionInfo() (*ConnectionInfo, error) {
+ 	return connInfo, nil
+ }
+ 
++// devInsecureNATS reports whether the agent should connect to NATS without TLS.
++// This is a development-only workaround for the local Docker-CPI setup, which
++// runs NATS in plaintext. It is off unless BOSH_AGENT_DEV_INSECURE_NATS is set
++// to a truthy value, so production behaviour (mutual TLS) is unchanged.
++func devInsecureNATS() bool {
++	switch os.Getenv("BOSH_AGENT_DEV_INSECURE_NATS") {
++	case "1", "true", "TRUE", "yes", "YES":
++		return true
++	default:
++		return false
++	}
++}
++
+ func (h *natsHandler) generateCEFLog(natsMsg *nats.Msg, severity int, statusReason string) {
+ 	cef := boshhandler.NewCommonEventFormat()
+ 
+diff --git a/servicemanager/systemd_service_manager.go b/servicemanager/systemd_service_manager.go
+index ead25f0..dc91340 100644
+--- a/servicemanager/systemd_service_manager.go
++++ b/servicemanager/systemd_service_manager.go
+@@ -13,6 +13,9 @@ func NewSystemdServiceManager(runner boshsys.CmdRunner) ServiceManager {
+ }
+ 
+ func (serviceManager systemdServiceManager) Kill(serviceName string) error {
++	// Kill stops the service (matches the interface's stop-not-restart contract).
++	// The previous containerized "restart" workaround is no longer needed: monit
++	// reload no longer relies on a kill+start cycle (see monit_job_supervisor.go).
+ 	_, _, _, err := serviceManager.runner.RunCommand("systemctl", "kill", serviceName)
+ 	return err
+ }
